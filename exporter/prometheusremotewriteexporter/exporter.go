@@ -31,6 +31,7 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 	"github.com/prometheus/prometheus/prompb"
+	"github.com/tidwall/wal"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/confighttp"
@@ -51,6 +52,15 @@ type PRWExporter struct {
 	concurrency     int
 	userAgentHeader string
 	clientSettings  *confighttp.HTTPClientSettings
+
+	// closed is set when .Shutdown is invoked.
+	closed bool
+
+	walMu     sync.Mutex
+	wal       *wal.Log
+	walConfig *walConfig
+	rWALIndex uint64
+	wWALIndex uint64
 }
 
 // NewPRWExporter initializes a new PRWExporter instance and sets fields accordingly.
@@ -66,17 +76,23 @@ func NewPRWExporter(cfg *Config, buildInfo component.BuildInfo) (*PRWExporter, e
 	}
 
 	userAgentHeader := fmt.Sprintf("%s/%s", strings.ReplaceAll(strings.ToLower(buildInfo.Description), " ", "-"), buildInfo.Version)
-
-	return &PRWExporter{
-		namespace:       cfg.Namespace,
+	prwe := &PrwExporter{
+		namespace:       namespace,
 		externalLabels:  sanitizedLabels,
 		endpointURL:     endpointURL,
 		wg:              new(sync.WaitGroup),
 		closeChan:       make(chan struct{}),
+		walConfig:       walCfg,
 		userAgentHeader: userAgentHeader,
 		concurrency:     cfg.RemoteWriteQueue.NumConsumers,
 		clientSettings:  &cfg.HTTPClientSettings,
-	}, nil
+		concurrency:     concurrency,
+	}
+
+	if err := prwe.turnOnWALIfEnabled(); err != nil {
+		return nil, err
+	}
+	return prwe, nil
 }
 
 // Start creates the prometheus client
@@ -85,11 +101,18 @@ func (prwe *PRWExporter) Start(_ context.Context, host component.Host) (err erro
 	return err
 }
 
+var errAlreadyClosed = errors.New("already closed")
+
 // Shutdown stops the exporter from accepting incoming calls(and return error), and wait for current export operations
 // to finish before returning
 func (prwe *PRWExporter) Shutdown(context.Context) error {
+	if prwe.closed {
+		return errAlreadyClosed
+	}
 	close(prwe.closeChan)
+	prwe.closed = true
 	prwe.wg.Wait()
+	prwe.closeWAL()
 	return nil
 }
 
@@ -251,6 +274,18 @@ func (prwe *PRWExporter) export(ctx context.Context, tsMap map[string]*prompb.Ti
 		return errs
 	}
 
+	if !prwe.walEnabled() {
+		return prwe.exportWriteRequests(ctx, requests)
+	}
+
+	// Otherwise, serialize the requests to the WAL.
+	if err := prwe.writeToWAL(requests); err != nil {
+		errs = append(errs, consumererror.Permanent(err))
+	}
+	return errs
+}
+
+func (prwe *PrwExporter) exportWriteRequests(ctx context.Context, requests []*prompb.WriteRequest) (errs []error) {
 	input := make(chan *prompb.WriteRequest, len(requests))
 	for _, request := range requests {
 		input <- request

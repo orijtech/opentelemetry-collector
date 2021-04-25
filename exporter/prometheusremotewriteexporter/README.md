@@ -48,6 +48,10 @@ Example:
 exporters:
   prometheusremotewrite:
     endpoint: "https://my-cortex:7900/api/v1/push"
+    wal: # Enabling the Write-Ahead-Log for the exporter
+        directory: "DIRECTORY_HERE"
+        truncate_frequency: "Optional Frequency to determine how often the WAL should be truncated; it is a time.ParseDuration https://golang.org/pkg/time/#ParseDuration; default of 1m"
+        cache_size: "An optional number of elements to be held in the WAL before truncating; default of 300"
 ```
 
 ## Advanced Configuration
