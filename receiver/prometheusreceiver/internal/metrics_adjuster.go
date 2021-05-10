@@ -20,9 +20,9 @@ import (
 	"sync"
 	"time"
 
-	metricspb "github.com/census-instrumentation/opencensus-proto/gen-go/metrics/v1"
 	"go.uber.org/zap"
-	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"go.opentelemetry.io/collector/consumer/pdata"
 )
 
 // Notes on garbage collection (gc):
@@ -62,9 +62,15 @@ import (
 // timeseriesinfo contains the information necessary to adjust from the initial point and to detect
 // resets.
 type timeseriesinfo struct {
-	mark     bool
-	initial  *metricspb.TimeSeries
-	previous *metricspb.TimeSeries
+	mark      bool
+	initial   *pdata.Metric
+	previous  *pdata.Metric
+	histogram *histogram
+}
+
+type histogram struct {
+	initial  *pdata.HistogramDataPoint
+	previous *pdata.HistogramDataPoint
 }
 
 // timeseriesMap maps from a timeseries instance (metric * label values) to the timeseries info for
@@ -76,13 +82,12 @@ type timeseriesMap struct {
 }
 
 // Get the timeseriesinfo for the timeseries associated with the metric and label values.
-func (tsm *timeseriesMap) get(
-	metric *metricspb.Metric, values []*metricspb.LabelValue) *timeseriesinfo {
-	name := metric.GetMetricDescriptor().GetName()
+func (tsm *timeseriesMap) get(metric *pdata.Metric, values pdata.StringMap) *timeseriesinfo {
+	name := metric.Name()
 	sig := getTimeseriesSignature(name, values)
 	tsi, ok := tsm.tsiMap[sig]
 	if !ok {
-		tsi = &timeseriesinfo{}
+		tsi = &timeseriesinfo{histogram: new(histogram)}
 		tsm.tsiMap[sig] = tsi
 	}
 	tsm.mark = true
@@ -113,13 +118,14 @@ func newTimeseriesMap() *timeseriesMap {
 }
 
 // Create a unique timeseries signature consisting of the metric name and label values.
-func getTimeseriesSignature(name string, values []*metricspb.LabelValue) string {
-	labelValues := make([]string, 0, len(values))
-	for _, label := range values {
-		if label.GetValue() != "" {
-			labelValues = append(labelValues, label.GetValue())
+func getTimeseriesSignature(name string, values pdata.StringMap) string {
+	labelValues := make([]string, 0, values.Len())
+	values.Range(func(key, value string) bool {
+		if value != "" {
+			labelValues = append(labelValues, value)
 		}
-	}
+		return true
+	})
 	return fmt.Sprintf("%s,%s", name, strings.Join(labelValues, ","))
 }
 
@@ -205,8 +211,8 @@ func NewMetricsAdjuster(tsm *timeseriesMap, logger *zap.Logger) *MetricsAdjuster
 // previous points in the timeseriesMap. If the metric is the first point in the timeseries, or the
 // timeseries has been reset, it is removed from the sequence and added to the timeseriesMap.
 // Additionally returns the total number of timeseries dropped from the metrics.
-func (ma *MetricsAdjuster) AdjustMetrics(metrics []*metricspb.Metric) ([]*metricspb.Metric, int) {
-	var adjusted = make([]*metricspb.Metric, 0, len(metrics))
+func (ma *MetricsAdjuster) AdjustMetrics(metrics []*pdata.Metric) ([]*pdata.Metric, int) {
+	var adjusted = make([]*pdata.Metric, 0, len(metrics))
 	dropped := 0
 	ma.tsm.Lock()
 	defer ma.tsm.Unlock()
@@ -230,9 +236,9 @@ func (ma *MetricsAdjuster) AdjustMetrics(metrics []*metricspb.Metric) ([]*metric
 // - MetricDescriptor_CUMULATIVE_DOUBLE
 // - MetricDescriptor_CUMULATIVE_DISTRIBUTION
 // - MetricDescriptor_SUMMARY
-func (ma *MetricsAdjuster) adjustMetric(metric *metricspb.Metric) (bool, int) {
-	switch metric.MetricDescriptor.Type {
-	case metricspb.MetricDescriptor_GAUGE_DOUBLE, metricspb.MetricDescriptor_GAUGE_DISTRIBUTION:
+func (ma *MetricsAdjuster) adjustMetric(metric *pdata.Metric) (bool, int) {
+	switch metric.DataType() {
+	case pdata.MetricDataTypeDoubleGauge, pdata.MetricDataTypeHistogram:
 		// gauges don't need to be adjusted so no additional processing is necessary
 		return true, 0
 	default:
@@ -243,53 +249,78 @@ func (ma *MetricsAdjuster) adjustMetric(metric *metricspb.Metric) (bool, int) {
 // Returns true if at least one of the metric's timeseries was adjusted and false if all of the
 // timeseries are an initial occurrence or a reset. Additionally returns the number of timeseries
 // dropped.
-func (ma *MetricsAdjuster) adjustMetricTimeseries(metric *metricspb.Metric) (bool, int) {
+func (ma *MetricsAdjuster) adjustMetricTimeseries(metric *pdata.Metric) (bool, int) {
 	dropped := 0
-	filtered := make([]*metricspb.TimeSeries, 0, len(metric.GetTimeseries()))
-	for _, current := range metric.GetTimeseries() {
-		tsi := ma.tsm.get(metric, current.GetLabelValues())
-		if tsi.initial == nil {
-			// initial timeseries
-			tsi.initial = current
-			tsi.previous = current
-			dropped++
-		} else {
-			if ma.adjustTimeseries(metric.MetricDescriptor.Type, current, tsi.initial,
-				tsi.previous) {
+	switch metric.DataType() {
+	case pdata.MetricDataTypeHistogram:
+		dataPoints := metric.Histogram().DataPoints()
+		filtered := make([]pdata.HistogramDataPoint, 0, dataPoints.Len())
+		for i := 0; i < dataPoints.Len(); i++ {
+			current := dataPoints.At(i)
+			tsi := ma.tsm.get(metric, current.LabelsMap())
+			if tsi.initial == nil {
+				tsi.initial = current
+				tsi.previous = current
+				continue
+			}
+
+			// Otherwise, try to adjust the time series.
+			if ma.adjustTimeseries(metric.DataType(), current, tsi.initial, tsi.previous) {
 				tsi.previous = current
 				filtered = append(filtered, current)
 			} else {
-				// reset timeseries
+				// reset timeseries.
 				tsi.initial = current
 				tsi.previous = current
 				dropped++
 			}
 		}
+		if len(filtered) != 0 {
+			dataPoints.Resize(0)
+			for _, okPoint := range filtered {
+				dataPoints.Append(okPoint)
+			}
+		}
+		return len(filtered) > 0, dropped
+
+	case pdata.MetricDataTypeSummary:
+
+	case pdata.MetricDataTypeDoubleGauge:
 	}
-	metric.Timeseries = filtered
-	return len(filtered) > 0, dropped
+
+	panic("Unimplemented")
 }
 
 // Returns true if 'current' was adjusted and false if 'current' is an the initial occurrence or a
 // reset of the timeseries.
-func (ma *MetricsAdjuster) adjustTimeseries(metricType metricspb.MetricDescriptor_Type,
-	current, initial, previous *metricspb.TimeSeries) bool {
-	if !ma.adjustPoints(
-		metricType, current.GetPoints(), initial.GetPoints(), previous.GetPoints()) {
+func (ma *MetricsAdjuster) adjustTimeseries(metricType pdata.MetricDataType, current, initial, previous *pdata.Metric) bool {
+	if !ma.adjustPoints(metricType, current, initial, previous) {
 		return false
 	}
-	current.StartTimestamp = initial.StartTimestamp
-	return true
-}
 
-func (ma *MetricsAdjuster) adjustPoints(metricType metricspb.MetricDescriptor_Type,
-	current, initial, previous []*metricspb.Point) bool {
-	if len(current) != 1 || len(initial) != 1 || len(current) != 1 {
-		ma.logger.Info("Adjusting Points, all lengths should be 1",
-			zap.Int("len(current)", len(current)), zap.Int("len(initial)", len(initial)), zap.Int("len(previous)", len(previous)))
-		return true
+	switch metricType {
+	case pdata.MetricDataTypeSummary:
+		currentDataPoints := current.Summary().DataPoints()
+		initialDataPoints := initial.Summary().DataPoints()
+		for i := 0; i < currentDataPoints.Len(); i++ {
+			currentDataPoints.At(i).SetStartTimestamp(initialDataPoints.At(i).StartTimestamp())
+		}
+
+	case pdata.MetricDataTypeHistogram:
+		currentDataPoints := current.Histogram().DataPoints()
+		initialDataPoints := initial.Histogram().DataPoints()
+		for i := 0; i < currentDataPoints.Len(); i++ {
+			currentDataPoints.At(i).SetStartTimestamp(initialDataPoints.At(i).StartTimestamp())
+		}
+
+	case pdata.MetricDataTypeDoubleGauge:
+		currentDataPoints := current.DoubleGauge().DataPoints()
+		initialDataPoints := initial.DoubleGauge().DataPoints()
+		for i := 0; i < currentDataPoints.Len(); i++ {
+			currentDataPoints.At(i).SetStartTimestamp(initialDataPoints.At(i).StartTimestamp())
+		}
 	}
-	return ma.adjustPoint(metricType, current[0], initial[0], previous[0])
+	return true
 }
 
 // Note: There is an important, subtle point here. When a new timeseries or a reset is detected,
@@ -299,59 +330,89 @@ func (ma *MetricsAdjuster) adjustPoints(metricType metricspb.MetricDescriptor_Ty
 // value/count/sum. This happens because the timeseries are updated in-place - if new copies of the
 // timeseries were created instead, previous could be used directly but this would mean reallocating
 // all of the metrics.
-func (ma *MetricsAdjuster) adjustPoint(metricType metricspb.MetricDescriptor_Type,
-	current, initial, previous *metricspb.Point) bool {
+func (ma *MetricsAdjuster) adjustPoints(metricType pdata.MetricDataType, current, initial, previous *pdata.Metric) bool {
 	switch metricType {
-	case metricspb.MetricDescriptor_CUMULATIVE_DOUBLE:
-		currentValue := current.GetDoubleValue()
-		initialValue := initial.GetDoubleValue()
+	case pdata.MetricDataTypeDoubleSum:
+		currentDataPoints := current.DoubleSum().DataPoints()
+		initialDataPoints := initial.DoubleSum().DataPoints()
+		previousDataPoints := previous.DoubleSum().DataPoints()
+		currentLen, initialLen, previousLen := currentDataPoints.Len(), initialDataPoints.Len(), previousDataPoints.Len()
+		if currentLen != 1 || initialLen != 1 || previousLen != 1 {
+			ma.logger.Info("Adjusting Points, all lengths should be 1",
+				zap.Int("len(current)", currentLen), zap.Int("len(initial)", initialLen), zap.Int("len(previous)", previousLen))
+			return true
+		}
+		currentValue := currentDataPoints.At(0).Value()
+		initialValue := initialDataPoints.At(0).Value()
 		previousValue := initialValue
 		if initial != previous {
-			previousValue += previous.GetDoubleValue()
+			previousValue += previousDataPoints.At(0).Value()
 		}
 		if currentValue < previousValue {
 			// reset detected
 			return false
 		}
-		current.Value =
-			&metricspb.Point_DoubleValue{DoubleValue: currentValue - initialValue}
-	case metricspb.MetricDescriptor_CUMULATIVE_DISTRIBUTION:
-		// note: sum of squared deviation not currently supported
-		currentDist := current.GetDistributionValue()
-		initialDist := initial.GetDistributionValue()
-		previousCount := initialDist.Count
-		previousSum := initialDist.Sum
-		if initial != previous {
-			previousCount += previous.GetDistributionValue().Count
-			previousSum += previous.GetDistributionValue().Sum
+		currentDataPoints.At(0).SetValue(currentValue - initialValue)
+
+	case pdata.MetricDataTypeHistogram:
+		currentDataPoints := current.Histogram().DataPoints()
+		initialDataPoints := initial.Histogram().DataPoints()
+		previousDataPoints := previous.Histogram().DataPoints()
+		currentLen, initialLen, previousLen := currentDataPoints.Len(), initialDataPoints.Len(), previousDataPoints.Len()
+		if currentLen != 1 || initialLen != 1 || previousLen != 1 {
+			ma.logger.Info("Adjusting Points, all lengths should be 1",
+				zap.Int("len(current)", currentLen), zap.Int("len(initial)", initialLen), zap.Int("len(previous)", previousLen))
+			return true
 		}
-		if currentDist.Count < previousCount || currentDist.Sum < previousSum {
+		// note: sum of squared deviation not currently supported
+		currentDist := currentDataPoints.At(0)
+		initialDist := initialDataPoints.At(0)
+		previousDist := previousDataPoints.At(0)
+		previousCount := initialDist.Count()
+		previousSum := initialDist.Sum()
+		if initialDist.Count() != previousDist.Count() || initialDist.Sum() != previousDist.Sum() {
+			previousCount += previousDist.Count()
+			previousSum += previousDist.Sum()
+		}
+		if currentDist.Count() < previousCount || currentDist.Sum() < previousSum {
 			// reset detected
 			return false
 		}
-		currentDist.Count -= initialDist.Count
-		currentDist.Sum -= initialDist.Sum
-		ma.adjustBuckets(currentDist.Buckets, initialDist.Buckets)
-	case metricspb.MetricDescriptor_SUMMARY:
+		currentDist.SetCount(currentDist.Count() - initialDist.Count())
+		currentDist.SetSum(currentDist.Sum() - initialDist.Sum())
+		ma.adjustBuckets(currentDataPoints, initialDataPoints)
+
+	case pdata.MetricDataTypeSummary:
+		currentDataPoints := current.Summary().DataPoints()
+		initialDataPoints := initial.Summary().DataPoints()
+		previousDataPoints := previous.Summary().DataPoints()
+		currentLen, initialLen, previousLen := currentDataPoints.Len(), initialDataPoints.Len(), previousDataPoints.Len()
+		if currentLen != 1 || initialLen != 1 || previousLen != 1 {
+			ma.logger.Info("Adjusting Points, all lengths should be 1",
+				zap.Int("len(current)", currentLen), zap.Int("len(initial)", initialLen), zap.Int("len(previous)", previousLen))
+			return true
+		}
 		// note: for summary, we don't adjust the snapshot
-		currentCount := current.GetSummaryValue().Count.GetValue()
-		currentSum := current.GetSummaryValue().Sum.GetValue()
-		initialCount := initial.GetSummaryValue().Count.GetValue()
-		initialSum := initial.GetSummaryValue().Sum.GetValue()
+		currentSumy := currentDataPoints.At(0)
+		initialSumy := initialDataPoints.At(0)
+		previousSumy := previousDataPoints.At(0)
+		currentCount := currentSumy.Count()
+		currentSum := currentSumy.Sum()
+		initialCount := initialSumy.Count()
+		initialSum := initialSumy.Sum()
 		previousCount := initialCount
 		previousSum := initialSum
 		if initial != previous {
-			previousCount += previous.GetSummaryValue().Count.GetValue()
-			previousSum += previous.GetSummaryValue().Sum.GetValue()
+			previousCount += previousSumy.Count()
+			previousSum += previousSumy.Sum()
 		}
 		if currentCount < previousCount || currentSum < previousSum {
 			// reset detected
 			return false
 		}
-		current.GetSummaryValue().Count =
-			&wrapperspb.Int64Value{Value: currentCount - initialCount}
-		current.GetSummaryValue().Sum =
-			&wrapperspb.DoubleValue{Value: currentSum - initialSum}
+		currentSumy.SetCount(currentCount - initialCount)
+		currentSumy.SetSum(currentSum - initialSum)
+
 	default:
 		// this shouldn't happen
 		ma.logger.Info("Adjust - skipping unexpected point", zap.String("type", metricType.String()))
@@ -359,13 +420,17 @@ func (ma *MetricsAdjuster) adjustPoint(metricType metricspb.MetricDescriptor_Typ
 	return true
 }
 
-func (ma *MetricsAdjuster) adjustBuckets(current, initial []*metricspb.DistributionValue_Bucket) {
-	if len(current) != len(initial) {
+func (ma *MetricsAdjuster) adjustBuckets(current, initial pdata.HistogramDataPointSlice) {
+	curLen, initialLen := current.Len(), initial.Len()
+	if curLen != initialLen {
 		// this shouldn't happen
-		ma.logger.Info("Bucket sizes not equal", zap.Int("len(current)", len(current)), zap.Int("len(initial)", len(initial)))
+		ma.logger.Info("Bucket sizes not equal", zap.Int("len(current)", curLen), zap.Int("len(initial)", initialLen))
 		return
 	}
-	for i := 0; i < len(current); i++ {
-		current[i].Count -= initial[i].Count
+
+	for i := 0; i < curLen; i++ {
+		currentPoint := current.At(i)
+		initialPoint := initial.At(i)
+		currentPoint.SetCount(currentPoint.Count() - initialPoint.Count())
 	}
 }

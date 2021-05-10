@@ -21,9 +21,6 @@ import (
 	"net"
 	"sync/atomic"
 
-	commonpb "github.com/census-instrumentation/opencensus-proto/gen-go/agent/common/v1"
-	metricspb "github.com/census-instrumentation/opencensus-proto/gen-go/metrics/v1"
-	resourcepb "github.com/census-instrumentation/opencensus-proto/gen-go/resource/v1"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/exemplar"
 	"github.com/prometheus/prometheus/pkg/labels"
@@ -33,8 +30,8 @@ import (
 
 	"go.opentelemetry.io/collector/config"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/consumer/pdata"
 	"go.opentelemetry.io/collector/obsreport"
-	"go.opentelemetry.io/collector/translator/internaldata"
 )
 
 const (
@@ -70,8 +67,7 @@ type transaction struct {
 	startTimeMetricRegex string
 	receiverID           config.ComponentID
 	ms                   *metadataService
-	node                 *commonpb.Node
-	resource             *resourcepb.Resource
+	resource             pdata.Resource
 	metricBuilder        *metricBuilder
 	logger               *zap.Logger
 }
@@ -141,7 +137,8 @@ func (tr *transaction) initTransaction(ls labels.Labels) error {
 		tr.job = job
 		tr.instance = instance
 	}
-	tr.node, tr.resource = createNodeAndResource(job, instance, mc.SharedLabels().Get(model.SchemeLabel))
+
+	tr.resource = createPdataResource(job, instance, mc.SharedLabels().Get(model.SchemeLabel))
 	tr.metricBuilder = newMetricBuilder(mc, tr.useStartTimeMetric, tr.startTimeMetricRegex, tr.logger)
 	tr.isNew = false
 	return nil
@@ -183,11 +180,8 @@ func (tr *transaction) Commit() error {
 
 	numPoints := 0
 	if len(metrics) > 0 {
-		md := internaldata.OCToMetrics(internaldata.MetricsData{
-			Node:     tr.node,
-			Resource: tr.resource,
-			Metrics:  metrics,
-		})
+		md := pdata.NewMetrics()
+		tr.resource.CopyTo(md.Resource())
 		_, numPoints = md.MetricAndDataPointCount()
 		err = tr.sink.ConsumeMetrics(ctx, md)
 	}
@@ -199,11 +193,11 @@ func (tr *transaction) Rollback() error {
 	return nil
 }
 
-func adjustStartTimestamp(startTime float64, metrics []*metricspb.Metric) {
+func adjustStartTimestamp(startTime float64, metrics []*pdata.Metric) {
 	startTimeTs := timestampFromFloat64(startTime)
 	for _, metric := range metrics {
-		switch metric.GetMetricDescriptor().GetType() {
-		case metricspb.MetricDescriptor_GAUGE_DOUBLE, metricspb.MetricDescriptor_GAUGE_DISTRIBUTION:
+		switch metric.DataType() {
+		case pdata.MetricDataTypeDoubleGauge, pdata.MetricDataTypeHistogram:
 			continue
 		default:
 			for _, ts := range metric.GetTimeseries() {
@@ -222,24 +216,16 @@ func timestampFromFloat64(ts float64) *timestamppb.Timestamp {
 	}
 }
 
-func createNodeAndResource(job, instance, scheme string) (*commonpb.Node, *resourcepb.Resource) {
+func createPdataResource(job, instance, scheme string) pdata.Resource {
 	host, port, err := net.SplitHostPort(instance)
 	if err != nil {
 		host = instance
 	}
-	node := &commonpb.Node{
-		ServiceInfo: &commonpb.ServiceInfo{Name: job},
-		Identifier: &commonpb.ProcessIdentifier{
-			HostName: host,
-		},
-	}
-	resource := &resourcepb.Resource{
-		Labels: map[string]string{
-			jobAttr:      job,
-			instanceAttr: instance,
-			portAttr:     port,
-			schemeAttr:   scheme,
-		},
-	}
-	return node, resource
+	resource := pdata.NewResource()
+	attrs := resource.Attributes()
+	attrs.UpsertString(jobAttr, job)
+	attrs.UpsertString(instanceAttr, instance)
+	attrs.UpsertString(portAttr, port)
+	attrs.UpsertString(schemeAttr, scheme)
+	return resource
 }

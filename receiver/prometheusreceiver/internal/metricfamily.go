@@ -18,12 +18,11 @@ import (
 	"sort"
 	"strings"
 
-	metricspb "github.com/census-instrumentation/opencensus-proto/gen-go/metrics/v1"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/textparse"
 	"github.com/prometheus/prometheus/scrape"
-	"google.golang.org/protobuf/types/known/timestamppb"
-	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"go.opentelemetry.io/collector/consumer/pdata"
 )
 
 // MetricFamily is unit which is corresponding to the metrics items which shared the same TYPE/UNIT/... metadata from
@@ -31,12 +30,12 @@ import (
 type MetricFamily interface {
 	Add(metricName string, ls labels.Labels, t int64, v float64) error
 	IsSameFamily(metricName string) bool
-	ToMetric() (*metricspb.Metric, int, int)
+	ToMetric() (*pdata.Metric, int, int)
 }
 
 type metricFamily struct {
 	name              string
-	mtype             metricspb.MetricDescriptor_Type
+	mtype             pdata.MetricDataType
 	mc                MetadataCache
 	droppedTimeseries int
 	labelKeys         map[string]bool
@@ -66,7 +65,7 @@ func newMetricFamily(metricName string, mc MetadataCache) MetricFamily {
 
 	return &metricFamily{
 		name:              familyName,
-		mtype:             convToOCAMetricType(metadata.Type),
+		mtype:             convToPdataType(metadata.Type),
 		mc:                mc,
 		droppedTimeseries: 0,
 		labelKeys:         make(map[string]bool),
@@ -103,10 +102,10 @@ func (mf *metricFamily) updateLabelKeys(ls labels.Labels) {
 }
 
 func (mf *metricFamily) isCumulativeType() bool {
-	return mf.mtype == metricspb.MetricDescriptor_CUMULATIVE_DOUBLE ||
-		mf.mtype == metricspb.MetricDescriptor_CUMULATIVE_INT64 ||
-		mf.mtype == metricspb.MetricDescriptor_CUMULATIVE_DISTRIBUTION ||
-		mf.mtype == metricspb.MetricDescriptor_SUMMARY
+	return mf.mtype == pdata.MetricDataTypeDoubleSum ||
+		mf.mtype == pdata.MetricDataTypeIntSum ||
+		mf.mtype == pdata.MetricDataTypeHistogram ||
+		mf.mtype == pdata.MetricDataTypeSummary
 }
 
 func (mf *metricFamily) getGroupKey(ls labels.Labels) string {
@@ -140,21 +139,27 @@ func (mf *metricFamily) loadMetricGroupOrCreate(groupKey string, ls labels.Label
 	return mg
 }
 
-func (mf *metricFamily) getLabelKeys() []*metricspb.LabelKey {
-	lks := make([]*metricspb.LabelKey, len(mf.labelKeysOrdered))
-	for i, k := range mf.labelKeysOrdered {
-		lks[i] = &metricspb.LabelKey{Key: k}
+func (mf *metricFamily) getLabelKeys(mg *metricGroup) pdata.StringMap {
+	sm := pdata.NewStringMap()
+	lmap := mg.ls.Map()
+	for i := range mf.labelKeysOrdered {
+		key := mf.labelKeysOrdered[i]
+		value := lmap[key]
+		sm.Upsert(key, value)
 	}
-	return lks
+	return sm
+}
+
+func isCummulativeType(typ pdata.MetricDataType) bool {
+	return typ == pdata.MetricDataTypeHistogram || typ == pdata.MetricDataTypeSummary
 }
 
 func (mf *metricFamily) Add(metricName string, ls labels.Labels, t int64, v float64) error {
 	groupKey := mf.getGroupKey(ls)
 	mg := mf.loadMetricGroupOrCreate(groupKey, ls, t)
-	switch mf.mtype {
-	case metricspb.MetricDescriptor_CUMULATIVE_DISTRIBUTION:
-		fallthrough
-	case metricspb.MetricDescriptor_SUMMARY:
+	if !isCummulativeType(mf.mtype) {
+		mg.value = v
+	} else {
 		switch {
 		case strings.HasSuffix(metricName, metricsSuffixSum):
 			// always use the timestamp from sum (count is ok too), because the startTs from quantiles won't be reliable
@@ -173,63 +178,67 @@ func (mf *metricFamily) Add(metricName string, ls labels.Labels, t int64, v floa
 			}
 			mg.complexValue = append(mg.complexValue, &dataPoint{value: v, boundary: boundary})
 		}
-	default:
-		mg.value = v
 	}
 
 	return nil
 }
 
-func (mf *metricFamily) ToMetric() (*metricspb.Metric, int, int) {
-	timeseries := make([]*metricspb.TimeSeries, 0, len(mf.groups))
+func (mf *metricFamily) ToMetric() (*pdata.Metric, int, int) {
+	metric := pdata.NewMetric()
+	nDataPoints := 0
+
 	switch mf.mtype {
 	// not supported currently
 	// case metricspb.MetricDescriptor_GAUGE_DISTRIBUTION:
 	//	return nil
-	case metricspb.MetricDescriptor_CUMULATIVE_DISTRIBUTION:
+	case pdata.MetricDataTypeHistogram:
+		metric.SetDataType(pdata.MetricDataTypeHistogram)
+		dataPoints := metric.Histogram().DataPoints()
 		for _, mg := range mf.getGroups() {
-			tss := mg.toDistributionTimeSeries(mf.labelKeysOrdered)
-			if tss != nil {
-				timeseries = append(timeseries, tss)
-			} else {
+			dataPoint := dataPoints.AppendEmpty()
+			if !mg.toDistributionDataPoint(&dataPoint, mf.labelKeysOrdered) {
 				mf.droppedTimeseries++
 			}
 		}
-	case metricspb.MetricDescriptor_SUMMARY:
+		nDataPoints = dataPoints.Len()
+
+	case pdata.MetricDataTypeSummary:
+		metric.SetDataType(pdata.MetricDataTypeSummary)
+		dataPoints := metric.Summary().DataPoints()
 		for _, mg := range mf.getGroups() {
-			tss := mg.toSummaryTimeSeries(mf.labelKeysOrdered)
-			if tss != nil {
-				timeseries = append(timeseries, tss)
-			} else {
+			dataPoint := dataPoints.AppendEmpty()
+			if !mg.toSummaryDataPoint(&dataPoint, mf.labelKeysOrdered) {
 				mf.droppedTimeseries++
 			}
 		}
+		nDataPoints = dataPoints.Len()
+
+	case pdata.MetricDataTypeDoubleSum:
+		metric.SetDataType(pdata.MetricDataTypeDoubleSum)
+		dataPoints := metric.DoubleSum().DataPoints()
+		for _, mg := range mf.getGroups() {
+			dataPoint := dataPoints.AppendEmpty()
+			if !mg.toDoubleDataPoint(&dataPoint, mf.labelKeysOrdered) {
+				mf.droppedTimeseries++
+			}
+		}
+		nDataPoints = dataPoints.Len()
+
 	default:
+		metric.SetDataType(pdata.MetricDataTypeDoubleSum)
+		dataPoints := metric.DoubleSum().DataPoints()
 		for _, mg := range mf.getGroups() {
-			tss := mg.toDoubleValueTimeSeries(mf.labelKeysOrdered)
-			if tss != nil {
-				timeseries = append(timeseries, tss)
-			} else {
+			dataPoint := dataPoints.AppendEmpty()
+			if !mg.toDoubleDataPoint(&dataPoint, mf.labelKeysOrdered) {
 				mf.droppedTimeseries++
 			}
 		}
+		nDataPoints = dataPoints.Len()
 	}
 
 	// note: the total number of timeseries is the length of timeseries plus the number of dropped timeseries.
-	numTimeseries := len(timeseries)
-	if numTimeseries != 0 {
-		return &metricspb.Metric{
-				MetricDescriptor: &metricspb.MetricDescriptor{
-					Name:        mf.name,
-					Description: mf.metadata.Help,
-					Unit:        heuristicalMetricAndKnownUnits(mf.name, mf.metadata.Unit),
-					Type:        mf.mtype,
-					LabelKeys:   mf.getLabelKeys(),
-				},
-				Timeseries: timeseries,
-			},
-			numTimeseries + mf.droppedTimeseries,
-			mf.droppedTimeseries
+	if nDataPoints > 0 {
+		return &metric, nDataPoints + mf.droppedTimeseries, mf.droppedTimeseries
 	}
 	return nil, mf.droppedTimeseries, mf.droppedTimeseries
 }
@@ -260,14 +269,14 @@ func (mg *metricGroup) sortPoints() {
 	})
 }
 
-func (mg *metricGroup) toDistributionTimeSeries(orderedLabelKeys []string) *metricspb.TimeSeries {
-	if !(mg.hasCount) || len(mg.complexValue) == 0 {
-		return nil
+func (mg *metricGroup) toDistributionDataPoint(dataPoint *pdata.HistogramDataPoint, orderedLabelKeys []string) bool {
+	if !mg.hasCount || len(mg.complexValue) == 0 {
+		return false
 	}
 	mg.sortPoints()
-	// for OCAgent Proto, the bounds won't include +inf
+	// for pdata and OCAgent Proto, the bounds won't include +inf
 	bounds := make([]float64, len(mg.complexValue)-1)
-	buckets := make([]*metricspb.DistributionValue_Bucket, len(mg.complexValue))
+	buckets := make([]uint64, len(mg.complexValue))
 
 	for i := 0; i < len(mg.complexValue); i++ {
 		if i != len(mg.complexValue)-1 {
@@ -278,96 +287,67 @@ func (mg *metricGroup) toDistributionTimeSeries(orderedLabelKeys []string) *metr
 		if i != 0 {
 			adjustedCount -= mg.complexValue[i-1].value
 		}
-		buckets[i] = &metricspb.DistributionValue_Bucket{Count: int64(adjustedCount)}
+		buckets[i] = uint64(adjustedCount)
 	}
 
-	dv := &metricspb.DistributionValue{
-		BucketOptions: &metricspb.DistributionValue_BucketOptions{
-			Type: &metricspb.DistributionValue_BucketOptions_Explicit_{
-				Explicit: &metricspb.DistributionValue_BucketOptions_Explicit{
-					Bounds: bounds,
-				},
-			},
-		},
-		Count:   int64(mg.count),
-		Sum:     mg.sum,
-		Buckets: buckets,
-		// SumOfSquaredDeviation:  // there's no way to compute this value from prometheus data
-	}
+	dataPoint.SetCount(uint64(mg.count))
+	dataPoint.SetExplicitBounds(bounds)
+	dataPoint.SetSum(mg.sum)
+	dataPoint.SetStartTimestamp(pdata.Timestamp(mg.ts))
+	dataPoint.SetTimestamp(pdata.Timestamp(mg.ts))
+	dataPoint.SetBucketCounts(buckets)
 
-	return &metricspb.TimeSeries{
-		StartTimestamp: timestampFromMs(mg.ts),
-		LabelValues:    populateLabelValues(orderedLabelKeys, mg.ls),
-		Points: []*metricspb.Point{
-			{
-				Timestamp: timestampFromMs(mg.ts),
-				Value:     &metricspb.Point_DistributionValue{DistributionValue: dv},
-			},
-		},
-	}
+	return true
 }
 
-func (mg *metricGroup) toSummaryTimeSeries(orderedLabelKeys []string) *metricspb.TimeSeries {
+func (mg *metricGroup) toSummaryDataPoint(dataPoint *pdata.SummaryDataPoint, orderedLabelKeys []string) bool {
 	// expecting count to be provided, however, in the following two cases, they can be missed.
 	// 1. data is corrupted
 	// 2. ignored by startValue evaluation
-	if !(mg.hasCount) {
-		return nil
+	if !mg.hasCount {
+		return false
 	}
 	mg.sortPoints()
-	percentiles := make([]*metricspb.SummaryValue_Snapshot_ValueAtPercentile, len(mg.complexValue))
-	for i, p := range mg.complexValue {
-		percentiles[i] =
-			&metricspb.SummaryValue_Snapshot_ValueAtPercentile{Percentile: p.boundary * 100, Value: p.value}
-	}
-
-	// allow percentiles to be nil when no data provided from prometheus
-	var snapshot *metricspb.SummaryValue_Snapshot
-	if len(percentiles) != 0 {
-		snapshot = &metricspb.SummaryValue_Snapshot{
-			PercentileValues: percentiles,
-		}
-	}
 
 	// Based on the summary description from https://prometheus.io/docs/concepts/metric_types/#summary
 	// the quantiles are calculated over a sliding time window, however, the count is the total count of
 	// observations and the corresponding sum is a sum of all observed values, thus the sum and count used
 	// at the global level of the metricspb.SummaryValue
+	dataPoint.SetCount(uint64(mg.count))
+	dataPoint.SetStartTimestamp(pdata.Timestamp(mg.ts))
+	dataPoint.SetTimestamp(pdata.Timestamp(mg.ts))
+	dataPoint.SetSum(mg.sum)
+	pQuantileValues := dataPoint.QuantileValues()
+	for _, p := range mg.complexValue {
+		pQuantile := pQuantileValues.AppendEmpty()
+		pQuantile.SetValue(p.value)
+		pQuantile.SetQuantile(p.boundary * 100)
+	}
 
-	summaryValue := &metricspb.SummaryValue{
-		Sum:      &wrapperspb.DoubleValue{Value: mg.sum},
-		Count:    &wrapperspb.Int64Value{Value: int64(mg.count)},
-		Snapshot: snapshot,
-	}
-	return &metricspb.TimeSeries{
-		StartTimestamp: timestampFromMs(mg.ts),
-		LabelValues:    populateLabelValues(orderedLabelKeys, mg.ls),
-		Points: []*metricspb.Point{
-			{Timestamp: timestampFromMs(mg.ts), Value: &metricspb.Point_SummaryValue{SummaryValue: summaryValue}},
-		},
-	}
+	populateLabelValues(orderedLabelKeys, mg.ls, dataPoint.LabelsMap())
+
+	return true
 }
 
-func (mg *metricGroup) toDoubleValueTimeSeries(orderedLabelKeys []string) *metricspb.TimeSeries {
-	var startTs *timestamppb.Timestamp
+func (mg *metricGroup) toDoubleDataPoint(dataPoint *pdata.DoubleDataPoint, orderedLabelKeys []string) bool {
+	mg.sortPoints()
+	var startTs pdata.Timestamp
 	// gauge/undefined types has no start time
 	if mg.family.isCumulativeType() {
-		startTs = timestampFromMs(mg.ts)
+		startTs = pdata.Timestamp(mg.ts)
 	}
 
-	return &metricspb.TimeSeries{
-		StartTimestamp: startTs,
-		Points:         []*metricspb.Point{{Timestamp: timestampFromMs(mg.ts), Value: &metricspb.Point_DoubleValue{DoubleValue: mg.value}}},
-		LabelValues:    populateLabelValues(orderedLabelKeys, mg.ls),
-	}
+	dataPoint.SetStartTimestamp(startTs)
+	dataPoint.SetTimestamp(pdata.Timestamp(mg.ts))
+	dataPoint.SetValue(mg.value)
+	populateLabelValues(orderedLabelKeys, mg.ls, dataPoint.LabelsMap())
+
+	return true
 }
 
-func populateLabelValues(orderedKeys []string, ls labels.Labels) []*metricspb.LabelValue {
-	lvs := make([]*metricspb.LabelValue, len(orderedKeys))
+func populateLabelValues(orderedKeys []string, ls labels.Labels, sm pdata.StringMap) {
 	lmap := ls.Map()
-	for i, k := range orderedKeys {
-		value := lmap[k]
-		lvs[i] = &metricspb.LabelValue{Value: value, HasValue: value != ""}
+	for _, key := range orderedKeys {
+		sm.Upsert(key, lmap[key])
 	}
-	return lvs
 }

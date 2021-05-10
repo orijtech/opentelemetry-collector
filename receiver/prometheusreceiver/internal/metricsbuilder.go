@@ -21,12 +21,13 @@ import (
 	"strconv"
 	"strings"
 
-	metricspb "github.com/census-instrumentation/opencensus-proto/gen-go/metrics/v1"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/textparse"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"go.opentelemetry.io/collector/consumer/pdata"
 )
 
 const (
@@ -48,7 +49,7 @@ type metricBuilder struct {
 	hasData              bool
 	hasInternalMetric    bool
 	mc                   MetadataCache
-	metrics              []*metricspb.Metric
+	metrics              []*pdata.Metric
 	numTimeseries        int
 	droppedTimeseries    int
 	useStartTimeMetric   bool
@@ -68,7 +69,7 @@ func newMetricBuilder(mc MetadataCache, useStartTimeMetric bool, startTimeMetric
 	}
 	return &metricBuilder{
 		mc:                   mc,
-		metrics:              make([]*metricspb.Metric, 0),
+		metrics:              make([]*pdata.Metric, 0),
 		logger:               logger,
 		numTimeseries:        0,
 		droppedTimeseries:    0,
@@ -135,10 +136,10 @@ func (b *metricBuilder) AddDataPoint(ls labels.Labels, t int64, v float64) error
 
 // Build an opencensus data.MetricsData based on all added data complexValue.
 // The only error returned by this function is errNoDataToBuild.
-func (b *metricBuilder) Build() ([]*metricspb.Metric, int, int, error) {
+func (b *metricBuilder) Build() ([]*pdata.Metric, int, int, error) {
 	if !b.hasData {
 		if b.hasInternalMetric {
-			return make([]*metricspb.Metric, 0), 0, 0, nil
+			return make([]*pdata.Metric, 0), 0, 0, nil
 		}
 		return nil, 0, 0, errNoDataToBuild
 	}
@@ -158,15 +159,14 @@ func (b *metricBuilder) Build() ([]*metricspb.Metric, int, int, error) {
 
 // TODO: move the following helper functions to a proper place, as they are not called directly in this go file
 
-func isUsefulLabel(mType metricspb.MetricDescriptor_Type, labelKey string) bool {
+func isUsefulLabel(mType pdata.MetricDataType, labelKey string) bool {
 	switch labelKey {
 	case model.MetricNameLabel, model.InstanceLabel, model.SchemeLabel, model.MetricsPathLabel, model.JobLabel:
 		return false
 	case model.BucketLabel:
-		return mType != metricspb.MetricDescriptor_GAUGE_DISTRIBUTION &&
-			mType != metricspb.MetricDescriptor_CUMULATIVE_DISTRIBUTION
+		return mType != pdata.MetricDataTypeHistogram
 	case model.QuantileLabel:
-		return mType != metricspb.MetricDescriptor_SUMMARY
+		return mType != pdata.MetricDataTypeSummary
 	}
 	return true
 }
@@ -205,13 +205,12 @@ func normalizeMetricName(name string) string {
 	return name
 }
 
-func getBoundary(metricType metricspb.MetricDescriptor_Type, labels labels.Labels) (float64, error) {
+func getBoundary(metricType pdata.MetricDataType, labels labels.Labels) (float64, error) {
 	labelName := ""
 	switch metricType {
-	case metricspb.MetricDescriptor_CUMULATIVE_DISTRIBUTION,
-		metricspb.MetricDescriptor_GAUGE_DISTRIBUTION:
+	case pdata.MetricDataTypeHistogram, pdata.MetricDataTypeIntHistogram:
 		labelName = model.BucketLabel
-	case metricspb.MetricDescriptor_SUMMARY:
+	case pdata.MetricDataTypeSummary:
 		labelName = model.QuantileLabel
 	default:
 		return 0, errNoBoundaryLabel
@@ -225,25 +224,25 @@ func getBoundary(metricType metricspb.MetricDescriptor_Type, labels labels.Label
 	return strconv.ParseFloat(v, 64)
 }
 
-func convToOCAMetricType(metricType textparse.MetricType) metricspb.MetricDescriptor_Type {
+func convToPdataType(metricType textparse.MetricType) pdata.MetricDataType {
 	switch metricType {
 	case textparse.MetricTypeCounter:
 		// always use float64, as it's the internal data type used in prometheus
-		return metricspb.MetricDescriptor_CUMULATIVE_DOUBLE
+		return pdata.MetricDataTypeDoubleSum
 	// textparse.MetricTypeUnknown is converted to gauge by default to fix Prometheus untyped metrics from being dropped
 	case textparse.MetricTypeGauge, textparse.MetricTypeUnknown:
-		return metricspb.MetricDescriptor_GAUGE_DOUBLE
+		return pdata.MetricDataTypeDoubleGauge
 	case textparse.MetricTypeHistogram:
-		return metricspb.MetricDescriptor_CUMULATIVE_DISTRIBUTION
+		return pdata.MetricDataTypeHistogram
 	// dropping support for gaugehistogram for now until we have an official spec of its implementation
 	// a draft can be found in: https://docs.google.com/document/d/1KwV0mAXwwbvvifBvDKH_LU1YjyXE_wxCkHNoCGq1GX0/edit#heading=h.1cvzqd4ksd23
 	// case textparse.MetricTypeGaugeHistogram:
 	//	return metricspb.MetricDescriptor_GAUGE_DISTRIBUTION
 	case textparse.MetricTypeSummary:
-		return metricspb.MetricDescriptor_SUMMARY
+		return pdata.MetricDataTypeSummary
 	default:
 		// including: textparse.MetricTypeInfo, textparse.MetricTypeStateset
-		return metricspb.MetricDescriptor_UNSPECIFIED
+		return pdata.MetricDataTypeNone
 	}
 }
 
