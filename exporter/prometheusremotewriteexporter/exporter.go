@@ -76,7 +76,7 @@ func NewPRWExporter(cfg *Config, buildInfo component.BuildInfo) (*PRWExporter, e
 	}
 
 	userAgentHeader := fmt.Sprintf("%s/%s", strings.ReplaceAll(strings.ToLower(buildInfo.Description), " ", "-"), buildInfo.Version)
-	prwe := &PrwExporter{
+	return &PrwExporter{
 		namespace:       namespace,
 		externalLabels:  sanitizedLabels,
 		endpointURL:     endpointURL,
@@ -87,12 +87,7 @@ func NewPRWExporter(cfg *Config, buildInfo component.BuildInfo) (*PRWExporter, e
 		concurrency:     cfg.RemoteWriteQueue.NumConsumers,
 		clientSettings:  &cfg.HTTPClientSettings,
 		concurrency:     concurrency,
-	}
-
-	if err := prwe.turnOnWALIfEnabled(); err != nil {
-		return nil, err
-	}
-	return prwe, nil
+	}, nil
 }
 
 // Start creates the prometheus client
@@ -114,6 +109,11 @@ func (prwe *PRWExporter) Shutdown(context.Context) error {
 	prwe.wg.Wait()
 	prwe.closeWAL()
 	return nil
+}
+
+// Start turns on the Write-Ahead-Log (WAL).
+func (prwe *PrwExporter) Start(ctx context.Context, host component.Host) error {
+	return prwe.turnOnWALIfEnabled()
 }
 
 // PushMetrics converts metrics to Prometheus remote write TimeSeries and send to remote endpoint. It maintain a map of
