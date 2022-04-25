@@ -29,9 +29,9 @@ require (
 	github.com/mitchellh/mapstructure v1.4.1
 	github.com/openzipkin/zipkin-go v0.2.5
 	github.com/pquerna/cachecontrol v0.1.0 // indirect
-	github.com/prometheus/client_golang v1.11.0
+	github.com/prometheus/client_golang v1.12.1
 	github.com/prometheus/client_model v0.2.0
-	github.com/prometheus/common v0.29.0
+	github.com/prometheus/common v0.34.0
 	github.com/prometheus/prometheus v1.8.2-0.20210621150501-ff58416a0b02
 	github.com/prometheus/statsd_exporter v0.21.0 // indirect
 	github.com/rs/cors v1.8.0
@@ -55,8 +55,8 @@ require (
 	go.opentelemetry.io/otel/trace v1.0.0-RC2
 	go.uber.org/atomic v1.9.0
 	go.uber.org/zap v1.18.1
-	golang.org/x/sys v0.0.0-20210615035016-665e8c7367d1
-	golang.org/x/text v0.3.6
+	golang.org/x/sys v0.0.0-20220114195835-da31bd327af9
+	golang.org/x/text v0.3.7
 	google.golang.org/genproto v0.0.0-20210604141403-392c879c8b08
 	google.golang.org/grpc v1.39.0
 	google.golang.org/protobuf v1.27.1
